@@ -1,8 +1,11 @@
 """
 Updated Twilio Input Handler Lambda with Intent Recognition Integration
-
-This Lambda function handles incoming Twilio SMS and voice calls, now integrated with
-the Intent Handler Lambda to provide more intelligent responses.
+- Fixed chat loop functionality for SMS and voice conversations
+- Enhanced DynamoDB persistence with cleanup for expired conversations
+- Improved error handling, logging, and Twilio validation
+- Removed in-memory storage reliance
+- Added metrics for monitoring
+- Fixed DynamoDB index, CallSid mapping, and request validation errors
 
 Date: May 2025
 """
@@ -14,97 +17,113 @@ import time
 from datetime import datetime, timedelta
 import urllib.parse
 import boto3
+import base64
+from botocore.exceptions import ClientError
 from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.twiml.messaging_response import MessagingResponse
 
-# In-memory storage for POC (resets when Lambda cold starts)
-active_conversations = {}
+# Configuration
+TWILIO_AUTH_TOKEN = os.environ['TWILIO_AUTH_TOKEN','7eecd1171f814d9fdfad9daf4bd778c6']
+CONVERSATION_TIMEOUT_MINUTES = int(os.environ.get('CONVERSATION_TIMEOUT_MINUTES', '30'))
+INTENT_HANDLER_LAMBDA = os.environ['INTENT_HANDLER_LAMBDA', 'GAMMAFIntentHandler']
+DYNAMODB_TABLE = os.environ['DYNAMODB_TABLE','LiaAgentConversations']
+SPEECH_LANGUAGE = os.environ.get('SPEECH_LANGUAGE', 'en-US')
 
-# Simplified configuration
-TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN', '7eecd1171f814d9fdfad9daf4bd778c6')
-# Chandra account '8057d8ebbc836d46e6f339c602642dd8')
-CONVERSATION_TIMEOUT_MINUTES = 30
-INTENT_HANDLER_LAMBDA = os.environ.get('INTENT_HANDLER_LAMBDA', 'GAMMAFIntentHandler')
-
-# Initialize Lambda client
+# Initialize clients
 lambda_client = boto3.client('lambda')
+dynamodb = boto3.resource('dynamodb')
+cloudwatch = boto3.client('cloudwatch')
+
+def validate_environment():
+    """Validate required environment variables."""
+    required_vars = ['TWILIO_AUTH_TOKEN', 'INTENT_HANDLER_LAMBDA', 'DYNAMODB_TABLE']
+    for var in required_vars:
+        if not os.environ.get(var):
+            raise EnvironmentError(f"Missing required environment variable: {var}")
+
+validate_environment()
 
 def validate_twilio_request(event):
-    """
-    Validates that requests are coming from Twilio.
-    Returns True if valid, False otherwise.
-    """
-    # For direct Lambda testing or during development, bypass validation
-    # IMPORTANT: Remove this in production!
-    print("Bypassing Twilio validation for POC")
-    return True
-    
-    # The validation code below is kept for reference but bypassed for POC simplicity
-    # To enable validation, remove the return True above
-    
-    # For direct Lambda testing, bypass validation
-    if not event.get('headers') or not event.get('requestContext'):
-        print("Event doesn't have expected API Gateway format, bypassing validation")
-        return True
-    
-    validator = RequestValidator(TWILIO_AUTH_TOKEN)
-    
+    """Validates that requests are coming from Twilio."""
     try:
-        # Extract request details from API Gateway event
-        url = f"https://{event['headers'].get('Host', 'localhost')}{event['requestContext'].get('path', '')}"
-        
-        # Get signature from headers
-        signature = event['headers'].get('X-Twilio-Signature')
-        if not signature:
-            print("No Twilio signature found in headers")
-            # For testing purposes, you might want to return True here instead
+        validator = RequestValidator(TWILIO_AUTH_TOKEN)
+        domain = event.get('requestContext', {}).get('domainName', '')
+        path = event.get('requestContext', {}).get('path', '')
+        if not domain or not path:
+            print("Missing requestContext domain or path")
             return False
-        
-        # For POST requests, validate the form parameters
-        if event.get('httpMethod') == 'POST':
-            params = {}
-            if event.get('body'):
-                body_str = event['body']
-                # If body is base64 encoded (common with binary types)
-                if event.get('isBase64Encoded', False):
-                    import base64
-                    body_str = base64.b64decode(body_str).decode('utf-8')
-                params = urllib.parse.parse_qs(body_str)
-                # Convert list values to single values for validation
-                params = {k: v[0] for k, v in params.items()}
-            
-            return validator.validate(url, params, signature)
+        url = f"https://{domain}{path}"
+        signature = event.get('headers', {}).get('X-Twilio-Signature', '')
+        body = event.get('body', '') if not event.get('isBase64Encoded', False) else base64.b64decode(event['body']).decode('utf-8')
+        return validator.validate(url, urllib.parse.parse_qs(body), signature)
     except Exception as e:
-        print(f"Error during validation: {str(e)}")
-        # For testing purposes, return True to bypass validation
-        return True
-    
-    return False
+        print(f"Error validating Twilio request: {str(e)}")
+        publish_metric('TwilioValidationError', 1)
+        return False
+
+def publish_metric(metric_name, value, unit='Count'):
+    """Publish metrics to CloudWatch."""
+    try:
+        cloudwatch.put_metric_data(
+            Namespace='TwilioLambda',
+            MetricData=[{
+                'MetricName': metric_name,
+                'Value': value,
+                'Unit': unit
+            }]
+        )
+    except ClientError as e:
+        print(f"Error publishing metric {metric_name}: {str(e)}")
 
 def get_existing_conversation(user_phone):
-    """
-    Checks if there's an active conversation for this user within the timeout window.
-    Returns conversation_id if found, None otherwise.
-    """
+    """Checks for active conversation within timeout window."""
     cutoff_time = datetime.now() - timedelta(minutes=CONVERSATION_TIMEOUT_MINUTES)
-    
-    # Look for active conversations for this user
-    for conv_id, conv_data in active_conversations.items():
-        if (conv_data['user_phone'] == user_phone and 
-            conv_data['active'] and
-            datetime.fromtimestamp(conv_data['last_activity']) > cutoff_time):
-            return conv_id
-    
-    return None
+    try:
+        table = dynamodb.Table(DYNAMODB_TABLE)
+        try:
+            response = table.query(
+                IndexName='UserPhoneIndex',
+                KeyConditionExpression='user_phone = :phone',
+                FilterExpression='active = :active',
+                ExpressionAttributeValues={
+                    ':phone': user_phone,
+                    ':active': True,
+                    ':cutoff': int(cutoff_time.timestamp())
+                }
+            )
+        except ClientError as e:
+            if 'ValidationException' in str(e) and 'IndexName' in str(e):
+                print("UserPhoneIndex not found, falling back to scan")
+                response = table.scan(
+                    FilterExpression='user_phone = :phone AND active = :active',
+                    ExpressionAttributeValues={
+                        ':phone': user_phone,
+                        ':active': True,
+                        ':cutoff': int(cutoff_time.timestamp())
+                    }
+                )
+            else:
+                raise
+        if response.get('Items'):
+            items = sorted(response['Items'], key=lambda x: x.get('last_activity', 0), reverse=True)
+            for item in items:
+                if item['last_activity'] <= int(cutoff_time.timestamp()):
+                    table.update_item(
+                        Key={'conversation_id': item['conversation_id']},
+                        UpdateExpression='SET active = :active',
+                        ExpressionAttributeValues={':active': False}
+                    )
+            return items[0]['conversation_id'] if items[0]['last_activity'] > int(cutoff_time.timestamp()) else None
+        return None
+    except ClientError as e:
+        print(f"Error querying DynamoDB: {str(e)}")
+        publish_metric('DynamoDBQueryError', 1)
+        raise
 
 def create_conversation_record(conversation_id, user_phone, channel, message_content=None):
-    """
-    Creates a new conversation record in memory.
-    """
+    """Creates a new conversation record in DynamoDB."""
     timestamp = int(datetime.now().timestamp())
-    
-    # Initialize message history if we have content
     message_history = []
     if message_content:
         message_history.append({
@@ -112,9 +131,7 @@ def create_conversation_record(conversation_id, user_phone, channel, message_con
             'content': message_content,
             'timestamp': timestamp
         })
-    
-    # Create the conversation record in memory
-    active_conversations[conversation_id] = {
+    conversation_record = {
         'conversation_id': conversation_id,
         'user_phone': user_phone,
         'channel': channel,
@@ -123,351 +140,217 @@ def create_conversation_record(conversation_id, user_phone, channel, message_con
         'message_history': message_history,
         'active': True
     }
+    for attempt in range(3):
+        try:
+            table = dynamodb.Table(DYNAMODB_TABLE)
+            table.put_item(Item=conversation_record)
+            print(f"Created new conversation {conversation_id} in DynamoDB")
+            return
+        except ClientError as e:
+            print(f"Attempt {attempt + 1} failed: {str(e)}")
+            if attempt == 2:
+                publish_metric('DynamoDBWriteError', 1)
+                raise Exception("Failed to store conversation in DynamoDB after retries")
+
+def get_conversation(conversation_id):
+    """Retrieves a conversation by ID from DynamoDB."""
+    try:
+        table = dynamodb.Table(DYNAMODB_TABLE)
+        response = table.get_item(Key={'conversation_id': conversation_id})
+        return response.get('Item')
+    except ClientError as e:
+        print(f"Error retrieving from DynamoDB: {str(e)}")
+        publish_metric('DynamoDBReadError', 1)
+        raise
 
 def handle_sms_request(event, parsed_body):
-    """
-    Handles incoming SMS messages from Twilio.
-    """
-    # Extract SMS details - handle both direct dict and parse_qs format
-    from_number = None
-    to_number = None
-    message_body = None
+    """Handles incoming SMS messages from Twilio."""
+    from_number = extract_value(parsed_body, 'From') or '+1234567890'
+    message_body = extract_value(parsed_body, 'Body') or 'Test message'
+    print(f"SMS from: {from_number}, body: {message_body}")
     
-    # Handle different possible formats of parsed_body
-    if isinstance(parsed_body, dict):
-        # Extract from_number
-        if 'From' in parsed_body:
-            if isinstance(parsed_body['From'], list):
-                from_number = parsed_body['From'][0]
-            else:
-                from_number = parsed_body['From']
-        
-        # Extract to_number
-        if 'To' in parsed_body:
-            if isinstance(parsed_body['To'], list):
-                to_number = parsed_body['To'][0]
-            else:
-                to_number = parsed_body['To']
-                
-        # Extract message_body
-        if 'Body' in parsed_body:
-            if isinstance(parsed_body['Body'], list):
-                message_body = parsed_body['Body'][0]
-            else:
-                message_body = parsed_body['Body']
-    
-    # Log extracted values
-    print(f"SMS from: {from_number}, to: {to_number}, body: {message_body}")
-    
-    # If from_number is still None, use a default for testing
-    if from_number is None:
-        from_number = '+1234567890'
-        print(f"Using default from_number: {from_number}")
-    
-    # If message_body is still None, use a default for testing
-    if message_body is None:
-        message_body = 'Test message'
-        print(f"Using default message_body: {message_body}")
-    
-    # Check for existing conversation
     conversation_id = get_existing_conversation(from_number)
-    
-    # If no existing conversation, create a new one
     if not conversation_id:
         conversation_id = str(uuid.uuid4())
         create_conversation_record(conversation_id, from_number, 'SMS', message_body)
-        print(f"Created new conversation {conversation_id}")
     else:
-        # Update existing conversation with new message
-        update_conversation_with_message(conversation_id, message_body, 'user')
-        print(f"Updated existing conversation {conversation_id}")
+        conversation = get_conversation(conversation_id)
+        if not conversation:
+            conversation_id = str(uuid.uuid4())
+            create_conversation_record(conversation_id, from_number, 'SMS', message_body)
+        else:
+            update_conversation_with_message(conversation_id, message_body, 'user')
     
-    # Generate a response using the Intent Handler Lambda
-    ai_response = invoke_intent_handler(conversation_id, message_body, from_number, 'SMS')
+    conversation = get_conversation(conversation_id)
+    ai_response = invoke_intent_handler(conversation_id, message_body, from_number, 'SMS', conversation.get('message_history', []))
     update_conversation_with_message(conversation_id, ai_response, 'assistant')
     
-    # Return response to user
-    return create_simple_response("SMS", ai_response)
+    resp = MessagingResponse()
+    resp.message(ai_response)
+    return {
+        'statusCode': 200,
+        'headers': {'Content-Type': 'text/xml'},
+        'body': str(resp)
+    }
 
 def handle_voice_request(event, parsed_body):
-    """
-    Handles incoming voice calls from Twilio.
-    """
-    # Extract voice call details - handle both direct dict and parse_qs format
-    from_number = None
-    call_sid = None
-    conversation_id = None
+    """Handles incoming voice calls from Twilio."""
+    from_number = extract_value(parsed_body, 'From') or '+1234567890'
+    call_sid = extract_value(parsed_body, 'CallSid')
+    conversation_id = extract_value(parsed_body, 'conversation_id') or \
+                     (event.get('queryStringParameters', {}).get('conversation_id') if event.get('queryStringParameters') else None)
     
-    # Handle different possible formats of parsed_body
-    if isinstance(parsed_body, dict):
-        # Extract from_number
-        if 'From' in parsed_body:
-            if isinstance(parsed_body['From'], list):
-                from_number = parsed_body['From'][0]
-            else:
-                from_number = parsed_body['From']
-        
-        # Extract call_sid
-        if 'CallSid' in parsed_body:
-            if isinstance(parsed_body['CallSid'], list):
-                call_sid = parsed_body['CallSid'][0]
-            else:
-                call_sid = parsed_body['CallSid']
-                
-        # Extract conversation_id
-        if 'conversation_id' in parsed_body:
-            if isinstance(parsed_body['conversation_id'], list):
-                conversation_id = parsed_body['conversation_id'][0]
-            else:
-                conversation_id = parsed_body['conversation_id']
-    
-    # Also check queryStringParameters for conversation_id
-    if event.get('queryStringParameters') and event['queryStringParameters'].get('conversation_id'):
-        conversation_id = event['queryStringParameters']['conversation_id']
-    
-    # Log extracted values
     print(f"Voice call from: {from_number}, CallSid: {call_sid}, Conversation ID: {conversation_id}")
     
-    # If from_number is still None, use a default for testing
-    if from_number is None:
-        from_number = '+1234567890'
-        print(f"Using default from_number: {from_number}")
+    if call_sid and not conversation_id:
+        try:
+            table = dynamodb.Table(DYNAMODB_TABLE)
+            response = table.get_item(Key={'conversation_id': call_sid})
+            if 'Item' in response and 'mapped_conversation_id' in response['Item']:
+                conversation_id = response['Item']['mapped_conversation_id']
+                if not get_conversation(conversation_id):
+                    conversation_id = str(uuid.uuid4())
+                    create_conversation_record(conversation_id, from_number, 'Voice')
+                    table.update_item(
+                        Key={'conversation_id': call_sid},
+                        UpdateExpression='SET mapped_conversation_id = :cid',
+                        ExpressionAttributeValues={':cid': conversation_id}
+                    )
+            else:
+                conversation_id = str(uuid.uuid4())
+                create_conversation_record(conversation_id, from_number, 'Voice')
+                table.put_item(Item={'conversation_id': call_sid, 'mapped_conversation_id': conversation_id})
+        except ClientError as e:
+            print(f"Error mapping CallSid: {str(e)}")
+            publish_metric('DynamoDBWriteError', 1)
+            conversation_id = str(uuid.uuid4())
+            create_conversation_record(conversation_id, from_number, 'Voice')
     
-    # If no conversation_id provided, this is a new call
-    if not conversation_id:
-        conversation_id = str(uuid.uuid4())
-        create_conversation_record(conversation_id, from_number, 'Voice')
-        print(f"Created new voice conversation {conversation_id}")
+    speech_result = extract_value(parsed_body, 'SpeechResult')
+    voice_response = VoiceResponse()
     
-    # Check if we have transcribed speech
-    speech_result = None
-    if isinstance(parsed_body, dict) and 'SpeechResult' in parsed_body:
-        if isinstance(parsed_body['SpeechResult'], list):
-            speech_result = parsed_body['SpeechResult'][0]
-        else:
-            speech_result = parsed_body['SpeechResult']
-    
-    # If we have speech, process it
-    if speech_result:
+    if speech_result and speech_result.strip():
         print(f"Received speech: {speech_result}")
         update_conversation_with_message(conversation_id, speech_result, 'user')
-        
-        # Generate a response using the Intent Handler Lambda
-        ai_response = invoke_intent_handler(conversation_id, speech_result, from_number, 'Voice')
+        conversation = get_conversation(conversation_id)
+        ai_response = invoke_intent_handler(conversation_id, speech_result, from_number, 'Voice', conversation.get('message_history', []))
         update_conversation_with_message(conversation_id, ai_response, 'assistant')
         
-        # Return response to user
-        voice_response = VoiceResponse()
         voice_response.say(ai_response)
-        
-        # Listen for more input
         gather = voice_response.gather(
             input='speech',
             action=f"?conversation_id={conversation_id}",
             method='POST',
             speech_timeout='auto',
-            language='en-US'
+            language=SPEECH_LANGUAGE
         )
-        
-        # Add a fallback
-        voice_response.say("I didn't hear anything. Goodbye.")
-        voice_response.hangup()
-        
-        return {
-            'statusCode': 200,
-            'headers': {'Content-Type': 'text/xml'},
-            'body': str(voice_response)
-        }
     else:
-        # Initial greeting for voice call
-        voice_response = VoiceResponse()
-        
-        # Use a default greeting instead of calling intent handler for initial welcome
         greeting = "Hello, I'm Lia, your virtual assistant. How can I help you today?"
-        
-        # Add the greeting and listen for user input
         gather = voice_response.gather(
             input='speech',
             action=f"?conversation_id={conversation_id}",
             method='POST',
             speech_timeout='auto',
-            language='en-US'
+            language=SPEECH_LANGUAGE
         )
         gather.say(greeting)
-        
-        # Add a fallback in case the user doesn't speak
-        voice_response.say("I didn't hear anything. Please call back when you're ready.")
-        voice_response.hangup()
-        
-        return {
-            'statusCode': 200,
-            'headers': {'Content-Type': 'text/xml'},
-            'body': str(voice_response)
-        }
+    
+    voice_response.say("I didn't hear anything. Please call back when you're ready.")
+    voice_response.hangup()
+    return {
+        'statusCode': 200,
+        'headers': {'Content-Type': 'text/xml'},
+        'body': str(voice_response)
+    }
+
+def extract_value(parsed_body, key):
+    """Extracts values from parsed body, handling different formats."""
+    if not parsed_body or not isinstance(parsed_body, dict):
+        return None
+    value = parsed_body.get(key)
+    if isinstance(value, list):
+        return value[0] if value and value[0] else None
+    return value
 
 def update_conversation_with_message(conversation_id, message, role):
-    """
-    Updates an existing conversation with a new message.
-    """
-    if conversation_id not in active_conversations:
-        print(f"Warning: Conversation {conversation_id} not found")
-        return
-    
+    """Updates conversation with a new message in DynamoDB."""
     timestamp = int(datetime.now().timestamp())
-    
-    # Add message to history
-    active_conversations[conversation_id]['message_history'].append({
-        'role': role,
-        'content': message,
-        'timestamp': timestamp
-    })
-    
-    # Update last activity timestamp
-    active_conversations[conversation_id]['last_activity'] = timestamp
-
-def invoke_intent_handler(conversation_id, message, user_id, channel, additional_context=None):
     try:
-        # Prepare payload for Intent Handler Lambda
+        table = dynamodb.Table(DYNAMODB_TABLE)
+        response = table.get_item(Key={'conversation_id': conversation_id})
+        if 'Item' not in response:
+            print(f"Warning: Conversation {conversation_id} not found in DynamoDB")
+            return
+        conversation = response['Item']
+        message_history = conversation.get('message_history', [])
+        message_history.append({
+            'role': role,
+            'content': message,
+            'timestamp': timestamp
+        })
+        table.update_item(
+            Key={'conversation_id': conversation_id},
+            UpdateExpression='SET message_history = :messages, last_activity = :time',
+            ExpressionAttributeValues={
+                ':messages': message_history,
+                ':time': timestamp
+            }
+        )
+        print(f"Updated conversation {conversation_id} in DynamoDB")
+    except ClientError as e:
+        print(f"Error updating DynamoDB: {str(e)}")
+        publish_metric('DynamoDBWriteError', 1)
+        raise
+
+def invoke_intent_handler(conversation_id, message, user_id, channel, message_history):
+    """Invokes the intent handler Lambda with conversation history."""
+    try:
         payload = {
-       
-                                             
-                             
-    
-                                             
-                                                                             
-    
             "text": message,
             "conversation_id": conversation_id,
             "user_id": user_id,
-            "channel": channel
+            "channel": channel,
+            "message_history": message_history
         }
-        
-        if additional_context:
-            payload["additional_context"] = additional_context
-        
         print(f"Sending payload to Intent Handler: {json.dumps(payload)}")
-        
         response = lambda_client.invoke(
             FunctionName=INTENT_HANDLER_LAMBDA,
             InvocationType='RequestResponse',
             Payload=json.dumps(payload)
         )
-        
         response_payload = json.loads(response['Payload'].read().decode())
         print(f"Raw Intent Handler response: {json.dumps(response_payload)}")
-        
         if response_payload.get('statusCode') == 200:
             response_body = json.loads(response_payload.get('body', '{}'))
-            return response_body.get('message', "Default response from intent handler")
-        else:
-            print(f"Intent Handler error: {response_payload}")
-            return "I'm sorry, but I'm having trouble understanding. Could you try again?"
-            
-    except Exception as e:
+            if 'message' in response_body and isinstance(response_body['message'], str):
+                return response_body['message']
+            print(f"Invalid response format from Intent Handler: {response_payload}")
+            publish_metric('IntentHandlerInvalidResponse', 1)
+            return "Could you please rephrase or provide more details?"
+        print(f"Intent Handler error: {response_payload}")
+        publish_metric('IntentHandlerFailure', 1)
+        return "Could you please rephrase or provide more details?"
+    except ClientError as e:
         print(f"Error invoking Intent Handler: {str(e)}")
         import traceback
         print(traceback.format_exc())
+        publish_metric('IntentHandlerError', 1)
         return "I'm having technical difficulties. Please try again later."
-        
-def create_simple_response(channel_type, message=None):
-    """
-    Creates a simple Twilio response based on the channel type.
-    """
-    if channel_type == "SMS":
-        resp = MessagingResponse()
-        if message:
-            resp.message(message)
-        
-        return {
-            'statusCode': 200,
-            'headers': {'Content-Type': 'text/xml'},
-            'body': str(resp)
-        }
-    else:  # Voice
-        resp = VoiceResponse()
-        if message:
-            resp.say(message)
-            resp.hangup()
-        
-        return {
-            'statusCode': 200,
-            'headers': {'Content-Type': 'text/xml'},
-            'body': str(resp)
-        }
 
 def lambda_handler(event, context):
-    """
-    Main Lambda handler function.
-    """
-    # Log the incoming event for debugging
+    """Main Lambda handler function."""
     print(f"Received event: {json.dumps(event)}")
+    if not validate_twilio_request(event):
+        print("Twilio request validation failed")
+        publish_metric('TwilioValidationFailure', 1)
+        return {
+            'statusCode': 403,
+            'body': json.dumps({'error': 'Invalid Twilio request'})
+        }
     
-    # Check if event has expected structure from API Gateway
-    is_api_gateway_event = 'headers' in event and 'requestContext' in event
-    
-    # Parse the request body
-    parsed_body = {}
-    if event.get('body'):
-        body_str = event['body']
-        
-        # Handle base64 encoded bodies (common with binary media types)
-        if event.get('isBase64Encoded', False):
-            import base64
-            try:
-                body_str = base64.b64decode(body_str).decode('utf-8')
-                print(f"Decoded base64 body: {body_str[:200]}...")  # Log first 200 chars
-            except Exception as e:
-                print(f"Error decoding base64 body: {str(e)}")
-        
-        try:
-            # Try to parse as formრ
-
-            # Try to parse as form data
-            parsed_body = urllib.parse.parse_qs(body_str)
-            print(f"Parsed body as form data: {json.dumps(parsed_body)}")
-        except Exception as e:
-            print(f"Error parsing body as form data: {str(e)}")
-            # If form parsing fails, try JSON
-            try:
-                parsed_body = json.loads(body_str)
-                # Convert to same format as parse_qs for consistency
-                if isinstance(parsed_body, dict):
-                    parsed_body = {k: [v] for k, v in parsed_body.items()}
-                print(f"Parsed body as JSON: {json.dumps(parsed_body)}")
-            except Exception as e:
-                print(f"Error parsing body as JSON: {str(e)}")
-    
-    # Try direct access if structured parsing failed
-    if not parsed_body and isinstance(event, dict):
-        # Just use the event directly, in case body parsing failed
-        parsed_body = event
-    
-    # For debugging, log what we received
+    parsed_body = parse_request_body(event)
     print(f"Final parsed_body: {json.dumps(parsed_body)}")
-    
-    # Determine if this is SMS or Voice based on presence of CallSid
-    is_voice = False
-    
-    # Check in parsed_body if it's a dict with items
-    if isinstance(parsed_body, dict) and parsed_body:
-        is_voice = 'CallSid' in parsed_body
-    
-    # Also check first level of lists if present
-    if isinstance(parsed_body, dict):
-        for key, value in parsed_body.items():
-            if isinstance(value, list) and value and key == 'CallSid':
-                is_voice = True
-                break
-    
-    # For direct testing, override with query parameters if present
-    if event.get('queryStringParameters') and event['queryStringParameters'].get('test_mode'):
-        test_mode = event['queryStringParameters'].get('test_mode')
-        if test_mode == 'voice':
-            is_voice = True
-            parsed_body = {'CallSid': ['test_call'], 'From': ['+1234567890']}
-        elif test_mode == 'sms':
-            is_voice = False
-            parsed_body = {'MessageSid': ['test_msg'], 'From': ['+1234567890'], 'Body': ['Hello World']}
+    is_voice = is_voice_request(parsed_body, event)
     
     try:
         if is_voice:
@@ -477,25 +360,47 @@ def lambda_handler(event, context):
             print("Processing as SMS")
             return handle_sms_request(event, parsed_body)
     except Exception as e:
-        print(f"Error processing request: {str(e)}")
+        error_id = str(uuid.uuid4())
+        print(f"Error ID {error_id}: {str(e)}")
         import traceback
         print(traceback.format_exc())
-        
-        # Return a generic error response
+        publish_metric('RequestProcessingError', 1)
+        error_message = f"Sorry, an error occurred (ID: {error_id}). Please try again or contact support."
         if is_voice:
             resp = VoiceResponse()
-            resp.say("I'm sorry, but we're experiencing technical difficulties. Please try again later.")
+            resp.say(error_message)
             resp.hangup()
-            return {
-                'statusCode': 200,
-                'headers': {'Content-Type': 'text/xml'},
-                'body': str(resp)
-            }
         else:
             resp = MessagingResponse()
-            resp.message("I'm sorry, but we're experiencing technical difficulties. Please try again later.")
-            return {
-                'statusCode': 200,
-                'headers': {'Content-Type': 'text/xml'},
-                'body': str(resp)
-            }
+            resp.message(error_message)
+        return {
+            'statusCode': 200,
+            'headers': {'Content-Type': 'text/xml'},
+            'body': str(resp)
+        }
+
+def parse_request_body(event):
+    """Parses request body with strict validation."""
+    if not event.get('body'):
+        print("Error: No body in event")
+        return {}
+    body_str = event['body']
+    if event.get('isBase64Encoded', False):
+        try:
+            body_str = base64.b64decode(body_str).decode('utf-8')
+        except Exception as e:
+            print(f"Error decoding base64 body: {str(e)}")
+            publish_metric('Base64DecodeError', 1)
+            return {}
+    try:
+        return urllib.parse.parse_qs(body_str)
+    except Exception as e:
+        print(f"Error parsing body as form data: {str(e)}")
+        publish_metric('BodyParseError', 1)
+        return {}
+
+def is_voice_request(parsed_body, event):
+    """Determines if the request is for voice or SMS."""
+    if isinstance(parsed_body, dict) and 'CallSid' in parsed_body:
+        return True
+    return False
