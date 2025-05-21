@@ -6,6 +6,7 @@ Updated Twilio Input Handler Lambda with Intent Recognition Integration
 - Removed in-memory storage reliance
 - Added metrics for monitoring
 - Fixed DynamoDB index, CallSid mapping, and request validation errors
+- Standardized voice call conversation ID handling using CallSid
 
 Date: May 2025
 """
@@ -123,6 +124,7 @@ def get_existing_conversation(user_phone):
 
 def create_conversation_record(conversation_id, user_phone, channel, message_content=None):
     """Creates a new conversation record in DynamoDB."""
+    print(f"CREATE_CONV_RECORD: Creating record for conversation_id: {conversation_id}")
     timestamp = int(datetime.now().timestamp())
     message_history = []
     if message_content:
@@ -154,9 +156,11 @@ def create_conversation_record(conversation_id, user_phone, channel, message_con
 
 def get_conversation(conversation_id):
     """Retrieves a conversation by ID from DynamoDB."""
+    print(f"GET_CONVERSATION (Twilio): Querying for conversation_id: {conversation_id}")
     try:
         table = dynamodb.Table(DYNAMODB_TABLE)
         response = table.get_item(Key={'conversation_id': conversation_id})
+        print(f"GET_CONVERSATION (Twilio): Found item for {conversation_id}" if response.get('Item') else f"GET_CONVERSATION (Twilio): No item found for {conversation_id}")
         return response.get('Item')
     except ClientError as e:
         print(f"Error retrieving from DynamoDB: {str(e)}")
@@ -197,66 +201,102 @@ def handle_voice_request(event, parsed_body):
     """Handles incoming voice calls from Twilio."""
     from_number = extract_value(parsed_body, 'From') or '+1234567890'
     call_sid = extract_value(parsed_body, 'CallSid')
-    conversation_id = extract_value(parsed_body, 'conversation_id') or \
-                     (event.get('queryStringParameters', {}).get('conversation_id') if event.get('queryStringParameters') else None)
+
+    # If CallSid is missing, it's a critical error for voice processing.
+    if not call_sid:
+        print("Error: CallSid not found in request. Cannot process voice call.")
+        publish_metric('MissingCallSidError', 1)
+        voice_response_error = VoiceResponse()
+        voice_response_error.say("An error occurred with your call. Please try again later.")
+        voice_response_error.hangup()
+        return {
+            'statusCode': 200, # Twilio expects a 200 OK with TwiML
+            'headers': {'Content-Type': 'text/xml'},
+            'body': str(voice_response_error)
+        }
+
+    # conversation_id from action URL (passed by previous Gather)
+    conversation_id_from_action = event.get('queryStringParameters', {}).get('conversation_id')
     
-    print(f"Voice call from: {from_number}, CallSid: {call_sid}, Conversation ID: {conversation_id}")
+    # Use CallSid as the primary conversation_id if not already passed in action URL
+    print(f"VOICE_HANDLER: CallSid received: {call_sid}, conversation_id from action: {conversation_id_from_action}")
+    current_conversation_id = conversation_id_from_action if conversation_id_from_action else call_sid
+    print(f"VOICE_HANDLER: Determined current_conversation_id: {current_conversation_id}")
     
-    if call_sid and not conversation_id:
-        try:
-            table = dynamodb.Table(DYNAMODB_TABLE)
-            response = table.get_item(Key={'conversation_id': call_sid})
-            if 'Item' in response and 'mapped_conversation_id' in response['Item']:
-                conversation_id = response['Item']['mapped_conversation_id']
-                if not get_conversation(conversation_id):
-                    conversation_id = str(uuid.uuid4())
-                    create_conversation_record(conversation_id, from_number, 'Voice')
-                    table.update_item(
-                        Key={'conversation_id': call_sid},
-                        UpdateExpression='SET mapped_conversation_id = :cid',
-                        ExpressionAttributeValues={':cid': conversation_id}
-                    )
-            else:
-                conversation_id = str(uuid.uuid4())
-                create_conversation_record(conversation_id, from_number, 'Voice')
-                table.put_item(Item={'conversation_id': call_sid, 'mapped_conversation_id': conversation_id})
-        except ClientError as e:
-            print(f"Error mapping CallSid: {str(e)}")
-            publish_metric('DynamoDBWriteError', 1)
-            conversation_id = str(uuid.uuid4())
-            create_conversation_record(conversation_id, from_number, 'Voice')
+    print(f"Voice call from: {from_number}, CallSid: {call_sid}, Current Conversation ID: {current_conversation_id}")
     
     speech_result = extract_value(parsed_body, 'SpeechResult')
     voice_response = VoiceResponse()
     
     if speech_result and speech_result.strip():
-        print(f"Received speech: {speech_result}")
-        update_conversation_with_message(conversation_id, speech_result, 'user')
-        conversation = get_conversation(conversation_id)
-        ai_response = invoke_intent_handler(conversation_id, speech_result, from_number, 'Voice', conversation.get('message_history', []))
-        update_conversation_with_message(conversation_id, ai_response, 'assistant')
+        print(f"VOICE_HANDLER: Processing SpeechResult for conversation_id: {current_conversation_id}")
+        print(f"Received speech: {speech_result} for conversation {current_conversation_id}")
+        # Ensure conversation record exists (it should if Gather was set up correctly)
+        # If not, it implies an issue or an unexpected state, create it to be safe.
+        conversation_check = get_conversation(current_conversation_id)
+        if not conversation_check:
+            print(f"Warning: Conversation record {current_conversation_id} not found despite SpeechResult. Creating one.")
+            create_conversation_record(current_conversation_id, from_number, 'Voice', speech_result) # Add speech as first user message
+        else:
+            update_conversation_with_message(current_conversation_id, speech_result, 'user')
+        
+        conversation = get_conversation(current_conversation_id) # Re-fetch to get message_history for intent handler
+        ai_response = invoke_intent_handler(current_conversation_id, speech_result, from_number, 'Voice', conversation.get('message_history', []))
+        update_conversation_with_message(current_conversation_id, ai_response, 'assistant')
         
         voice_response.say(ai_response)
         gather = voice_response.gather(
             input='speech',
-            action=f"?conversation_id={conversation_id}",
+            action=f"?conversation_id={current_conversation_id}", # Pass current_conversation_id
             method='POST',
             speech_timeout='auto',
             language=SPEECH_LANGUAGE
         )
     else:
-        greeting = "Hello, I'm Lia, your virtual assistant. How can I help you today?"
-        gather = voice_response.gather(
-            input='speech',
-            action=f"?conversation_id={conversation_id}",
-            method='POST',
-            speech_timeout='auto',
-            language=SPEECH_LANGUAGE
-        )
-        gather.say(greeting)
-    
-    voice_response.say("I didn't hear anything. Please call back when you're ready.")
-    voice_response.hangup()
+        # No speech result: this means it's the initial call or a gather timeout.
+        print(f"VOICE_HANDLER: No SpeechResult. Attempting to get conversation for: {current_conversation_id}")
+        existing_conversation = get_conversation(current_conversation_id)
+        if not existing_conversation:
+            # This is a new call (current_conversation_id is call_sid and no record exists)
+            print(f"VOICE_HANDLER: No existing conversation found for {current_conversation_id} (CallSid: {call_sid}). Creating new record.")
+            # create_conversation_record will log its own activity
+            create_conversation_record(current_conversation_id, from_number, 'Voice')
+            greeting = "Hello, I'm Lia, your virtual assistant. How can I help you today?"
+            # Say greeting before gathering
+            voice_response.say(greeting) 
+            print(f"VOICE_HANDLER: Setting Gather action URL with conversation_id: {current_conversation_id}")
+            gather = voice_response.gather(
+                input='speech',
+                action=f"?conversation_id={current_conversation_id}", # Pass current_conversation_id
+                method='POST',
+                speech_timeout='auto',
+                language=SPEECH_LANGUAGE
+            )
+            # No gather.say() here as we've already greeted.
+        else:
+            # Existing conversation, but no speech input (e.g., gather timeout on an ongoing call)
+            print(f"VOICE_HANDLER: Found existing conversation for {current_conversation_id}, but no speech input. Prompting again.")
+            re_prompt_message = "I didn't catch that. Could you please say it again?"
+            voice_response.say(re_prompt_message) 
+            print(f"VOICE_HANDLER: Setting Gather action URL with conversation_id: {current_conversation_id}")
+            gather = voice_response.gather(
+                input='speech',
+                action=f"?conversation_id={current_conversation_id}", # Pass current_conversation_id
+                method='POST',
+                speech_timeout='auto',
+                language=SPEECH_LANGUAGE
+            )
+            # No gather.say() here as we've already re-prompted.
+            
+    # Fallback if no gather was added to the response.
+    # This ensures Twilio doesn't get an empty response if logic above fails to add a Gather.
+    if "<Gather" not in str(voice_response):
+        print("Warning: No Gather verb found in TwiML response. Adding fallback hangup.")
+        # Adding a say before hangup, in case no say was added either.
+        if not voice_response.verbs: # Check if there are no verbs at all
+             voice_response.say("I'm sorry, there was an issue processing your request. Please call back later.")
+        voice_response.hangup()
+
     return {
         'statusCode': 200,
         'headers': {'Content-Type': 'text/xml'},
@@ -279,7 +319,9 @@ def update_conversation_with_message(conversation_id, message, role):
         table = dynamodb.Table(DYNAMODB_TABLE)
         response = table.get_item(Key={'conversation_id': conversation_id})
         if 'Item' not in response:
-            print(f"Warning: Conversation {conversation_id} not found in DynamoDB")
+            print(f"Warning: Conversation {conversation_id} not found in DynamoDB for update_conversation_with_message")
+            # Optionally, create the record if it's critical that messages are stored even if initial creation failed.
+            # For now, just log and return if no record to update.
             return
         conversation = response['Item']
         message_history = conversation.get('message_history', [])
@@ -290,10 +332,11 @@ def update_conversation_with_message(conversation_id, message, role):
         })
         table.update_item(
             Key={'conversation_id': conversation_id},
-            UpdateExpression='SET message_history = :messages, last_activity = :time',
+            UpdateExpression='SET message_history = :messages, last_activity = :time, active = :active_status',
             ExpressionAttributeValues={
                 ':messages': message_history,
-                ':time': timestamp
+                ':time': timestamp,
+                ':active_status': True # Ensure conversation is marked active on message update
             }
         )
         print(f"Updated conversation {conversation_id} in DynamoDB")
@@ -304,6 +347,7 @@ def update_conversation_with_message(conversation_id, message, role):
 
 def invoke_intent_handler(conversation_id, message, user_id, channel, message_history):
     """Invokes the intent handler Lambda with conversation history."""
+    print(f"INVOKE_INTENT_HANDLER: Invoking with conversation_id: {conversation_id}")
     try:
         payload = {
             "text": message,
@@ -374,7 +418,7 @@ def lambda_handler(event, context):
             resp = MessagingResponse()
             resp.message(error_message)
         return {
-            'statusCode': 200,
+            'statusCode': 200, # Twilio expects 200 for TwiML responses
             'headers': {'Content-Type': 'text/xml'},
             'body': str(resp)
         }
@@ -401,6 +445,13 @@ def parse_request_body(event):
 
 def is_voice_request(parsed_body, event):
     """Determines if the request is for voice or SMS."""
+    # Check if CallSid is in parsed_body, which is typical for voice calls.
+    # Also, check if 'SpeechResult' is present or if it's a GET request to the base path (initial call).
+    # This helps differentiate from SMS which are POSTs without CallSid in the same way.
     if isinstance(parsed_body, dict) and 'CallSid' in parsed_body:
         return True
+    # Check for path often associated with voice calls if other indicators are missing.
+    # This part might be too specific or need adjustment based on actual deployment.
+    # if event.get('rawPath') == '/LiaAgentPROD': # Example, adjust as needed
+    #    return True
     return False

@@ -5,6 +5,7 @@ Intent Handler Lambda for Lia AI Agent - Fixed for Chat Loop Persistence
 - Optimized DynamoDB interactions
 - Added metrics for monitoring
 - Fixed Bedrock response parsing, endpoint processing, and model ID alignment
+- Ensured CallSid is used as conversation_id for new voice call records in DynamoDB
 
 Date: May 2025
 """
@@ -23,7 +24,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Configuration
-DYNAMODB_TABLE = os.environ['DYNAMODB_TABLE','LiaLiaAgentConversations']
+DYNAMODB_TABLE = os.environ.get('DYNAMODB_TABLE','LiaAgentConversations')
 BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'anthropic.claude-3-haiku-20240307-v1:0')
 BEDROCK_REGION = os.environ.get('BEDROCK_REGION', 'us-east-2')
 
@@ -106,7 +107,8 @@ def lambda_handler(event, context):
     try:
         logger.info(f"Received event: {json.dumps(event)}")
         user_input = event.get('text', '')
-        conversation_id = event.get('conversation_id')
+        conversation_id = event.get('conversation_id') # This will be CallSid for new voice calls
+        logger.info(f"GAMMA_HANDLER: Received event with conversation_id: {conversation_id}")
         user_id = event.get('user_id', 'unknown_user')
         channel = event.get('channel', 'unknown')
         message_history = event.get('message_history', [])
@@ -119,26 +121,30 @@ def lambda_handler(event, context):
             publish_metric('MissingInputError', 1)
             return format_response(False, "Missing required parameter: text", 400)
         
+        # get_conversation_state will now use the passed conversation_id (CallSid)
+        # for new records if it's provided and not found, or generate a UUID if it's None.
         conversation_state = get_conversation_state(conversation_id, user_id, channel)
-        conversation_id = conversation_state['conversation_id']
+        # The conversation_id used for the rest of this lambda execution
+        # will be the one from conversation_state (either the original CallSid or a new UUID).
+        current_conversation_id_in_handler = conversation_state['conversation_id']
         
-        add_message_to_history(conversation_id, "user", user_input)
-        conversation_history = get_conversation_history(conversation_id)
+        add_message_to_history(current_conversation_id_in_handler, "user", user_input)
+        conversation_history = get_conversation_history(current_conversation_id_in_handler)
         
         if is_likely_knowledge_query(user_input):
             logger.info(f"Query '{user_input}' identified as likely knowledge query")
-            return format_response(True, handle_knowledge_base_intent(conversation_id, {}, user_input))
+            return format_response(True, handle_knowledge_base_intent(current_conversation_id_in_handler, {}, user_input))
         
-        current_state = conversation_state.get('state', 'initial')
+        current_internal_state = conversation_state.get('state', 'initial') # Renamed to avoid confusion
         pending_intent = conversation_state.get('pending_intent')
         
-        if current_state != 'initial' and pending_intent:
+        if current_internal_state != 'initial' and pending_intent:
             response = continue_conversation(
-                conversation_id, user_input, current_state, pending_intent, conversation_history
+                current_conversation_id_in_handler, user_input, current_internal_state, pending_intent, conversation_history
             )
         else:
             response = identify_and_process_intent(
-                conversation_id, user_input, conversation_history
+                current_conversation_id_in_handler, user_input, conversation_history
             )
         
         return format_response(True, response)
@@ -162,18 +168,35 @@ def is_likely_knowledge_query(text):
     return False
 
 def get_conversation_state(conversation_id, user_id, channel):
-    """Gets or creates a conversation state in DynamoDB."""
+    """
+    Gets or creates a conversation state in DynamoDB.
+    If conversation_id is provided and not found, it uses that ID for the new record.
+    If conversation_id is None, it generates a new UUID.
+    """
+    logger.info(f"GET_CONV_STATE: Called with conversation_id: {conversation_id}")
     if conversation_id:
         conversation = get_conversation(conversation_id)
         if conversation:
+            # Existing conversation found
+            logger.info(f"GET_CONV_STATE: Found existing conversation for id: {conversation_id}")
             conversation['last_activity'] = int(time.time())
             update_conversation(conversation_id, {'last_activity': conversation['last_activity']})
+            logger.info(f"Returning existing conversation: {conversation_id}")
             return conversation
+        else:
+            # Conversation ID was provided, but no record found. Use this ID for the new record.
+            logger.info(f"Conversation ID '{conversation_id}' provided but not found. Will create new record with this ID.")
+            id_for_new_record = conversation_id
+    else:
+        # No conversation_id provided (e.g., for non-voice channels or if it was None), generate a new one.
+        logger.info("No conversation_id provided. Generating new UUID for new record.")
+        id_for_new_record = str(uuid.uuid4())
     
-    new_conversation_id = str(uuid.uuid4())
+    logger.info(f"GET_CONV_STATE: Creating new conversation state with id: {id_for_new_record}")
+    # Create new conversation record
     timestamp = int(time.time())
-    conversation_state = {
-        'conversation_id': new_conversation_id,
+    new_conversation_data = {
+        'conversation_id': id_for_new_record,
         'user_id': user_id,
         'channel': channel,
         'start_time': timestamp,
@@ -181,19 +204,20 @@ def get_conversation_state(conversation_id, user_id, channel):
         'state': 'initial',
         'pending_intent': None,
         'collected_info': {},
-        'message_history': []
+        'message_history': []  # Initialize with empty history
     }
-    store_conversation(new_conversation_id, conversation_state)
-    logger.info(f"Created new conversation: {new_conversation_id}")
-    return conversation_state
+    store_conversation(id_for_new_record, new_conversation_data)
+    logger.info(f"Created new conversation with ID: {id_for_new_record}")
+    return new_conversation_data
 
 def get_conversation(conversation_id):
     """Retrieves a conversation by ID from DynamoDB."""
+    logger.info(f"GET_CONVERSATION (Gamma): Querying for conversation_id: {conversation_id}")
     try:
         table = dynamodb.Table(DYNAMODB_TABLE)
         response = table.get_item(Key={'conversation_id': conversation_id})
         if 'Item' in response:
-            logger.info(f"Retrieved conversation {conversation_id} from DynamoDB")
+            logger.info(f"Retrieved conversation {conversation_id} from DynamoDB") # Existing good log
             return response['Item']
         logger.warning(f"Conversation {conversation_id} not found in DynamoDB")
         return None
@@ -204,11 +228,12 @@ def get_conversation(conversation_id):
 
 def store_conversation(conversation_id, conversation_data):
     """Stores a conversation in DynamoDB."""
+    logger.info(f"STORE_CONVERSATION: Storing data for conversation_id: {conversation_id}, Data: {json.dumps(conversation_data)}")
     for attempt in range(3):
         try:
             table = dynamodb.Table(DYNAMODB_TABLE)
             table.put_item(Item=conversation_data)
-            logger.info(f"Stored conversation {conversation_id} in DynamoDB")
+            logger.info(f"Stored conversation {conversation_id} in DynamoDB") # Existing good log
             return
         except ClientError as e:
             logger.error(f"Attempt {attempt + 1} failed: {str(e)}")
@@ -218,6 +243,7 @@ def store_conversation(conversation_id, conversation_data):
 
 def update_conversation(conversation_id, updates):
     """Updates a conversation in DynamoDB."""
+    logger.info(f"UPDATE_CONVERSATION: Updating conversation_id: {conversation_id} with updates: {json.dumps(updates)}")
     try:
         table = dynamodb.Table(DYNAMODB_TABLE)
         update_expression = "SET " + ", ".join(f"#{k} = :{k}" for k in updates.keys())
@@ -237,11 +263,19 @@ def update_conversation(conversation_id, updates):
 
 def add_message_to_history(conversation_id, role, message):
     """Adds a message to the conversation history in DynamoDB."""
+    logger.info(f"ADD_MESSAGE_TO_HISTORY: Adding message for conversation_id: {conversation_id}, role: {role}")
     timestamp = int(time.time())
     conversation = get_conversation(conversation_id)
     if not conversation:
-        logger.warning(f"Cannot add message to non-existent conversation {conversation_id}")
-        return
+        # This can happen if get_conversation_state just created the record
+        # but the local variable 'conversation' here is not yet updated.
+        # Attempt to fetch it again.
+        logger.warning(f"Initial get_conversation failed in add_message_to_history for {conversation_id}. Re-fetching.")
+        conversation = get_conversation(conversation_id)
+        if not conversation:
+            logger.error(f"Cannot add message to non-existent conversation {conversation_id} even after re-fetch.")
+            return
+
     message_history = conversation.get('message_history', [])
     message_history.append({
         'role': role,
@@ -258,7 +292,7 @@ def get_conversation_history(conversation_id, max_messages=10):
     """Gets conversation history, limited to last 'max_messages'."""
     conversation = get_conversation(conversation_id)
     if not conversation:
-        logger.warning(f"Conversation {conversation_id} not found")
+        logger.warning(f"Conversation {conversation_id} not found for get_conversation_history")
         return []
     history = conversation.get('message_history', [])
     return history[-max_messages:]
@@ -267,7 +301,7 @@ def update_conversation_state(conversation_id, state_updates):
     """Updates the conversation state with new values."""
     conversation = get_conversation(conversation_id)
     if not conversation:
-        logger.warning(f"Conversation {conversation_id} not found")
+        logger.warning(f"Conversation {conversation_id} not found for update_conversation_state")
         return
     updates = state_updates.copy()
     updates['last_activity'] = int(time.time())
@@ -378,7 +412,7 @@ def continue_conversation(conversation_id, user_input, current_state, pending_in
     """Continues a multi-turn conversation by collecting required info."""
     conversation = get_conversation(conversation_id)
     if not conversation:
-        logger.warning(f"Conversation {conversation_id} not found")
+        logger.warning(f"Conversation {conversation_id} not found for continue_conversation")
         return "I'm sorry, something went wrong. Let's start over. How can I help you?"
     
     collected_info = conversation.get('collected_info', {})
@@ -443,7 +477,7 @@ def identify_and_process_intent(conversation_id, user_input, conversation_histor
     
     intent_response = call_bedrock_model(messages)
     if not intent_response:
-        if is_likely_knowledge_query(user_input):
+        if is_likely_knowledge_query(user_input): # Check again if it's a knowledge query on Bedrock fail
             return handle_knowledge_base_intent(conversation_id, {}, user_input)
         add_message_to_history(conversation_id, "assistant", "I'm having trouble understanding. Could you try again?")
         return "I'm having trouble understanding. Could you try again?"
@@ -451,8 +485,8 @@ def identify_and_process_intent(conversation_id, user_input, conversation_histor
     try:
         parsed_intent = parse_intent_response(intent_response)
         logger.info(f"Parsed intent: {json.dumps(parsed_intent)}")
-    except Exception:
-        if is_likely_knowledge_query(user_input):
+    except Exception: # Catch generic exception from parse_intent_response
+        if is_likely_knowledge_query(user_input): # Fallback for parsing error
             return handle_knowledge_base_intent(conversation_id, {}, user_input)
         add_message_to_history(conversation_id, "assistant", "I'm having trouble processing your request. Could you try asking in a different way?")
         return "I'm having trouble processing your request. Could you try asking in a different way?"
@@ -463,21 +497,23 @@ def identify_and_process_intent(conversation_id, user_input, conversation_histor
     required_info = parsed_intent.get('required_info', [])
     
     if not intent_type or intent_type not in AGENT_CAPABILITIES:
-        if is_likely_knowledge_query(user_input):
+        if is_likely_knowledge_query(user_input): # Fallback for unknown intent
             return handle_knowledge_base_intent(conversation_id, {}, user_input)
         add_message_to_history(conversation_id, "assistant", "I'm not sure what you're asking for. Could you please clarify?")
         return "I'm not sure what you're asking for. Could you please clarify?"
     
     capability = AGENT_CAPABILITIES[intent_type]
     if confidence < capability.get('confidence_threshold', 0.7):
+        # If confidence is low, but it's a knowledge_base type or seems like one, try it.
         if intent_type == "knowledge_base" or is_likely_knowledge_query(user_input):
             return handle_knowledge_base_intent(conversation_id, entities, user_input)
+        
         clarification_msg = f"I think you might be asking about {intent_type.replace('_', ' ')}, but I'm not entirely sure. Could you provide more details?"
         add_message_to_history(conversation_id, "assistant", clarification_msg)
         return clarification_msg
     
     if required_info:
-        collected_info = {k: v for k, v in entities.items() if v}
+        collected_info = {k: v for k, v in entities.items() if v} # Ensure only non-empty entities are collected
         update_conversation_state(conversation_id, {
             'state': 'collecting_info',
             'pending_intent': intent_type,
